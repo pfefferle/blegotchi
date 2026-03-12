@@ -8,7 +8,7 @@ import subprocess
 import time
 from datetime import datetime, UTC
 from io import StringIO
-from threading import Lock
+from threading import Lock, Thread
 
 import requests
 
@@ -92,6 +92,8 @@ class blegotchi(plugins.Plugin):
         self.handshake_dir = None
         self.devices_file = None
         self.is_auto = False
+        self._scanning = False
+        self._scan_result = None
 
     def on_loaded(self):
         logging.info("[blegotchi] plugin loaded")
@@ -202,22 +204,21 @@ class blegotchi(plugins.Plugin):
 
         return changed, new_name
 
-    def scan(self, ui=None):
-        if not self.ready:
+    def _start_scan(self):
+        if self._scanning or not self.ready:
             return
-
         if not os.path.exists(self.bettercap_path):
             logging.error(f"[blegotchi] bettercap not found at {self.bettercap_path}")
             return
 
+        self._scanning = True
+        self._scan_result = None
         logging.info("[blegotchi] scanning...")
 
-        if ui:
-            ui.set('face', self.BLE_FACE)
-            if self.is_auto:
-                ui.set('status', random.choice(self.SCAN_MESSAGES))
-            ui.update(force=True)
+        thread = Thread(target=self._run_scan, daemon=True)
+        thread.start()
 
+    def _run_scan(self):
         cmd = (
             f"{self.bettercap_path} -no-colors -eval "
             "'ble.recon on; events.ignore ble.device.lost; sleep 30; ble.recon off; exit'"
@@ -226,11 +227,20 @@ class blegotchi(plugins.Plugin):
             output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8')
         except subprocess.CalledProcessError as e:
             logging.error(f"[blegotchi] scan failed: {e}")
+            self._scanning = False
             return
+
+        self._scan_result = output
+        self._scanning = False
+
+    def _process_scan_result(self, ui):
+        output = self._scan_result
+        self._scan_result = None
 
         current_time = time.time()
         prev_total = len(self.data)
         changed = False
+        last_new_name = None
 
         for line in output.splitlines():
             if "new BLE device" not in line or "detected as" not in line:
@@ -243,10 +253,13 @@ class blegotchi(plugins.Plugin):
             changed |= device_changed
             self.recent_devices[device_info['mac_address']] = current_time
 
-            if ui and new_name:
-                ui.set('face', faces.EXCITED)
-                if self.is_auto:
-                    ui.set('status', random.choice(self.NEW_DEVICE_MESSAGES).format(name=new_name))
+            if new_name:
+                last_new_name = new_name
+
+        if last_new_name and ui:
+            ui.set('face', faces.EXCITED)
+            if self.is_auto:
+                ui.set('status', random.choice(self.NEW_DEVICE_MESSAGES).format(name=last_new_name))
 
         self.recent_devices = {
             mac: ts for mac, ts in self.recent_devices.items()
@@ -449,9 +462,18 @@ class blegotchi(plugins.Plugin):
         if not self.ready:
             return
 
-        if time.time() - self.last_scan_time >= self.timer:
+        # Process completed scan result
+        if self._scan_result is not None:
+            self._process_scan_result(ui)
+
+        # Start a new scan if timer elapsed and not already scanning
+        if not self._scanning and time.time() - self.last_scan_time >= self.timer:
             self.last_scan_time = time.time()
-            self.scan(ui)
+            if ui:
+                ui.set('face', self.BLE_FACE)
+                if self.is_auto:
+                    ui.set('status', random.choice(self.SCAN_MESSAGES))
+            self._start_scan()
 
         with ui._lock:
             if self.is_auto:
